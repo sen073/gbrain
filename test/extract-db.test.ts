@@ -1,13 +1,3 @@
-/**
- * Tests for `gbrain extract --source db` (v0.10.3 graph layer).
- *
- * Verifies the DB-source path of the unified `gbrain extract <subcommand>`
- * command. Companion to test/extract.test.ts which covers the fs-source path.
- *
- * Runs against in-memory PGLite. Idempotency, --type filtering, --dry-run
- * JSON output, and reconciliation correctness.
- */
-
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runExtract } from '../src/commands/extract.ts';
@@ -142,6 +132,86 @@ describe('gbrain extract links --source db', () => {
     const acmeLinks = await engine.getLinks('companies/acme');
     expect(acmeLinks.length).toBe(0);
   });
+
+  test('scoped source only creates links within the active source', async () => {
+    const db = (engine as any).db;
+    await db.query(`INSERT INTO sources (id, name) VALUES ('wiki', 'wiki') ON CONFLICT (id) DO NOTHING`);
+
+    await engine.putPage('people/alice', personPage('Alice (default)'));
+    await engine.putPage('people/alice', { ...personPage('Alice (wiki)'), source_id: 'wiki' });
+    await engine.putPage('companies/acme', companyPage('Acme (default)', '[Alice](people/alice) joined.'));
+    await engine.putPage('companies/acme', {
+      ...companyPage('Acme (wiki)', '[Alice](people/alice) joined.'),
+      source_id: 'wiki',
+    });
+
+    const previousSource = process.env.GBRAIN_SOURCE;
+    process.env.GBRAIN_SOURCE = 'wiki';
+    try {
+      await runExtract(engine, ['links', '--source', 'db']);
+    } finally {
+      if (previousSource === undefined) delete process.env.GBRAIN_SOURCE;
+      else process.env.GBRAIN_SOURCE = previousSource;
+    }
+
+    const defaultLinks = await engine.executeRaw<{ from_slug: string; to_slug: string; from_source_id: string; to_source_id: string }>(
+      `SELECT f.slug AS from_slug, t.slug AS to_slug, f.source_id AS from_source_id, t.source_id AS to_source_id
+       FROM links l
+       JOIN pages f ON f.id = l.from_page_id
+       JOIN pages t ON t.id = l.to_page_id
+       WHERE f.slug = $1 AND f.source_id = $2`,
+      ['companies/acme', 'default'],
+    );
+    const wikiLinks = await engine.executeRaw<{ from_slug: string; to_slug: string; from_source_id: string; to_source_id: string }>(
+      `SELECT f.slug AS from_slug, t.slug AS to_slug, f.source_id AS from_source_id, t.source_id AS to_source_id
+       FROM links l
+       JOIN pages f ON f.id = l.from_page_id
+       JOIN pages t ON t.id = l.to_page_id
+       WHERE f.slug = $1 AND f.source_id = $2`,
+      ['companies/acme', 'wiki'],
+    );
+
+    expect(defaultLinks).toHaveLength(0);
+    expect(wikiLinks).toHaveLength(1);
+    expect(wikiLinks[0].to_slug).toBe('people/alice');
+    expect(wikiLinks[0].from_source_id).toBe('wiki');
+    expect(wikiLinks[0].to_source_id).toBe('wiki');
+  });
+
+  test('same-slug multi-source links resolve to the current page source', async () => {
+    const db = (engine as any).db;
+    await db.query(`INSERT INTO sources (id, name) VALUES ('wiki', 'wiki') ON CONFLICT (id) DO NOTHING`);
+
+    await engine.putPage('people/alice', personPage('Alice (default)'));
+    await engine.putPage('people/alice', { ...personPage('Alice (wiki)'), source_id: 'wiki' });
+    await engine.putPage('companies/acme', {
+      ...companyPage('Acme (wiki)', '[Alice](people/alice) joined as CEO.'),
+      source_id: 'wiki',
+    });
+
+    const previousSource = process.env.GBRAIN_SOURCE;
+    process.env.GBRAIN_SOURCE = 'wiki';
+    try {
+      await runExtract(engine, ['links', '--source', 'db']);
+    } finally {
+      if (previousSource === undefined) delete process.env.GBRAIN_SOURCE;
+      else process.env.GBRAIN_SOURCE = previousSource;
+    }
+
+    const wikiLinks = await engine.executeRaw<{ to_slug: string; from_source_id: string; to_source_id: string }>(
+      `SELECT t.slug AS to_slug, f.source_id AS from_source_id, t.source_id AS to_source_id
+       FROM links l
+       JOIN pages f ON f.id = l.from_page_id
+       JOIN pages t ON t.id = l.to_page_id
+       WHERE f.slug = $1 AND f.source_id = $2`,
+      ['companies/acme', 'wiki'],
+    );
+
+    expect(wikiLinks).toHaveLength(1);
+    expect(wikiLinks[0].to_slug).toBe('people/alice');
+    expect(wikiLinks[0].from_source_id).toBe('wiki');
+    expect(wikiLinks[0].to_source_id).toBe('wiki');
+  });
 });
 
 describe('gbrain extract timeline --source db', () => {
@@ -161,6 +231,98 @@ describe('gbrain extract timeline --source db', () => {
     const entries = await engine.getTimeline('people/alice');
     expect(entries.length).toBe(2);
     expect(entries.map(e => e.summary).sort()).toEqual(['Closed Series A', 'Joined as CEO']);
+  });
+
+  test('projects timeline entries from a note onto the single linked entity even when note is inserted first', async () => {
+    await engine.putPage('sessions/standup', {
+      type: 'note' as any,
+      title: 'Standup',
+      compiled_truth: '[Alice](people/alice) discussed roadmap.',
+      timeline: '- **2026-01-15** | Discussed roadmap',
+    });
+    await engine.putPage('people/alice', {
+      type: 'person',
+      title: 'Alice',
+      compiled_truth: '',
+      timeline: '',
+    });
+
+    await runExtract(engine, ['timeline', '--source', 'db']);
+
+    const noteEntries = await engine.getTimeline('sessions/standup');
+    const personEntries = await engine.getTimeline('people/alice');
+    expect(noteEntries.map(e => e.summary)).toEqual(['Discussed roadmap']);
+    expect(personEntries.map(e => e.summary)).toEqual(['Discussed roadmap']);
+  });
+
+  test('scoped extraction reads GBRAIN_SOURCE and projects only within that source', async () => {
+    const db = (engine as any).db;
+    await db.query(`INSERT INTO sources (id, name) VALUES ('wiki', 'wiki') ON CONFLICT (id) DO NOTHING`);
+
+    await engine.putPage('people/alice', {
+      type: 'person',
+      title: 'Alice (default)',
+      compiled_truth: '',
+      timeline: '',
+    });
+    await engine.putPage('people/alice', {
+      type: 'person',
+      title: 'Alice (wiki)',
+      compiled_truth: '',
+      timeline: '',
+      source_id: 'wiki',
+    });
+    await engine.putPage('sessions/wiki-standup', {
+      type: 'note' as any,
+      title: 'Wiki Standup',
+      compiled_truth: '[Alice](people/alice) discussed roadmap.',
+      timeline: '- **2026-01-15** | Scoped roadmap',
+      source_id: 'wiki',
+    });
+
+    const previousSource = process.env.GBRAIN_SOURCE;
+    process.env.GBRAIN_SOURCE = 'wiki';
+    try {
+      await runExtract(engine, ['timeline', '--source', 'db']);
+    } finally {
+      if (previousSource === undefined) delete process.env.GBRAIN_SOURCE;
+      else process.env.GBRAIN_SOURCE = previousSource;
+    }
+
+    const defaultEntries = await engine.executeRaw<{ slug: string; source_id: string; summary: string }>(
+      `SELECT p.slug, p.source_id, te.summary
+       FROM timeline_entries te
+       JOIN pages p ON p.id = te.page_id
+       WHERE p.slug = $1 AND p.source_id = $2`,
+      ['people/alice', 'default'],
+    );
+    const wikiEntries = await engine.executeRaw<{ slug: string; source_id: string; summary: string }>(
+      `SELECT p.slug, p.source_id, te.summary
+       FROM timeline_entries te
+       JOIN pages p ON p.id = te.page_id
+       WHERE p.slug = $1 AND p.source_id = $2`,
+      ['people/alice', 'wiki'],
+    );
+    expect(defaultEntries.map(e => e.summary)).toEqual([]);
+    expect(wikiEntries.map(e => e.summary)).toEqual(['Scoped roadmap']);
+  });
+
+  test('does not project note timeline when multiple entities are linked', async () => {
+    await engine.putPage('people/alice', { type: 'person', title: 'Alice', compiled_truth: '', timeline: '' });
+    await engine.putPage('companies/acme', { type: 'company', title: 'Acme', compiled_truth: '', timeline: '' });
+    await engine.putPage('sessions/board-sync', {
+      type: 'note' as any,
+      title: 'Board Sync',
+      compiled_truth: '[Alice](people/alice) met with [Acme](companies/acme).',
+      timeline: '- **2026-01-15** | Reviewed growth plan',
+    });
+
+    await runExtract(engine, ['timeline', '--source', 'db']);
+
+    const aliceEntries = await engine.getTimeline('people/alice');
+    const acmeEntries = await engine.getTimeline('companies/acme');
+    expect(aliceEntries).toHaveLength(0);
+    expect(acmeEntries).toHaveLength(0);
   });
 
   test('idempotent via DB constraint', async () => {
@@ -238,14 +400,15 @@ describe('gbrain extract all --source db', () => {
     await engine.putPage('companies/acme', {
       type: 'company', title: 'Acme',
       compiled_truth: '[Alice](people/alice) joined as CEO.',
-      timeline: '- **2026-01-15** | Hired Alice',
+      timeline: '- **2026-01-15** | Funding closed',
     });
 
     await runExtract(engine, ['all', '--source', 'db']);
 
     const links = await engine.getLinks('companies/acme');
+    const timeline = await engine.getTimeline('companies/acme');
     expect(links.length).toBe(1);
-    const entries = await engine.getTimeline('companies/acme');
-    expect(entries.length).toBe(1);
+    expect(timeline.length).toBe(1);
+    expect(timeline[0].summary).toBe('Funding closed');
   });
 });

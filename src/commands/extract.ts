@@ -23,7 +23,7 @@ import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import {
   extractPageLinks, parseTimelineEntries, inferLinkType, makeResolver,
-  extractFrontmatterLinks,
+  extractFrontmatterLinks, extractEntityRefs,
   type UnresolvedFrontmatterRef,
 } from '../core/link-extraction.ts';
 import { createProgress } from '../core/progress.ts';
@@ -341,6 +341,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   const since = (sinceIdx >= 0 && sinceIdx + 1 < args.length) ? args[sinceIdx + 1] : undefined;
   const dryRun = args.includes('--dry-run');
   const jsonMode = args.includes('--json');
+  const scopedSourceId = source === 'db' && process.env.GBRAIN_SOURCE ? process.env.GBRAIN_SOURCE : undefined;
   // --include-frontmatter: v0.13 flag. Default OFF for back-compat. The
   // v0_13_0 migration orchestrator runs this once under the hood; users
   // opt in for subsequent runs.
@@ -382,12 +383,12 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
       // can opt in via mode + source.
       result = { links_created: 0, timeline_entries_created: 0, pages_processed: 0 };
       if (subcommand === 'links' || subcommand === 'all') {
-        const r = await extractLinksFromDB(engine, dryRun, jsonMode, typeFilter, since, { includeFrontmatter });
+        const r = await extractLinksFromDB(engine, dryRun, jsonMode, typeFilter, since, scopedSourceId, { includeFrontmatter });
         result.links_created = r.created;
         result.pages_processed = r.pages;
       }
       if (subcommand === 'timeline' || subcommand === 'all') {
-        const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since);
+        const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, scopedSourceId);
         result.timeline_entries_created = r.created;
         result.pages_processed = Math.max(result.pages_processed, r.pages);
       }
@@ -579,6 +580,7 @@ async function extractLinksFromDB(
   jsonMode: boolean,
   typeFilter: PageType | undefined,
   since: string | undefined,
+  scopeSourceId: string | undefined,
   opts?: { includeFrontmatter?: boolean },
 ): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[] }> {
   const includeFrontmatter = opts?.includeFrontmatter ?? false;
@@ -591,8 +593,25 @@ async function extractLinksFromDB(
   const nullResolver = {
     resolve: async () => null as string | null,
   };
-  const allSlugs = await engine.getAllSlugs();
-  const slugList = Array.from(allSlugs);
+  const scopedPages = scopeSourceId
+    ? await engine.executeRaw<Record<string, unknown>>(
+        `SELECT id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, source_id
+         FROM pages WHERE source_id = $1`,
+        [scopeSourceId],
+      )
+    : null;
+  const allSlugs = scopeSourceId ? new Set((scopedPages || []).map((row) => String(row.slug))) : await engine.getAllSlugs();
+  const slugList = scopeSourceId ? (scopedPages || []).map((row) => String(row.slug)) : Array.from(allSlugs);
+  const pageMetaRows = await engine.executeRaw<{ slug: string; type: string; source_id: string }>(
+    `SELECT slug, type, source_id FROM pages${scopeSourceId ? ' WHERE source_id = $1' : ''}`,
+    scopeSourceId ? [scopeSourceId] : [],
+  );
+  const pageMetasBySlug = new Map<string, Array<{ slug: string; type: string; source_id: string }>>();
+  for (const row of pageMetaRows) {
+    const list = pageMetasBySlug.get(String(row.slug)) || [];
+    list.push({ slug: String(row.slug), type: String(row.type), source_id: String(row.source_id) });
+    pageMetasBySlug.set(String(row.slug), list);
+  }
   let processed = 0, created = 0;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
@@ -618,24 +637,37 @@ async function extractLinksFromDB(
     }
   }
 
+  function resolveSourceIdForSlug(candidateSlug: string, preferredSourceId?: string): string | null {
+    const matches = pageMetasBySlug.get(candidateSlug) || [];
+    if (matches.length === 0) return null;
+    if (preferredSourceId) {
+      const exact = matches.find((row) => row.source_id === preferredSourceId);
+      if (exact) return exact.source_id;
+    }
+    if (matches.length === 1) return matches[0].source_id;
+    return null;
+  }
+
   for (let i = 0; i < slugList.length; i++) {
     const slug = slugList[i];
-    const page = await engine.getPage(slug);
+    const page = scopeSourceId
+      ? (scopedPages || []).find((row) => String(row.slug) === slug) as Record<string, unknown> | undefined
+      : await engine.getPage(slug) as unknown as Record<string, unknown> | undefined;
     if (!page) continue;
     if (typeFilter && page.type !== typeFilter) continue;
     if (since) {
-      const updatedMs = new Date(page.updated_at).getTime();
+      const updatedMs = new Date(String(page.updated_at)).getTime();
       const sinceMs = new Date(since).getTime();
       if (Number.isFinite(sinceMs) && updatedMs <= sinceMs) continue;
     }
 
-    const fullContent = page.compiled_truth + '\n' + page.timeline;
+    const fullContent = String(page.compiled_truth || '') + '\n' + String(page.timeline || '');
     // --include-frontmatter default OFF in v0.13 (codex tension 5, back-compat).
     // Migration orchestrator explicitly enables it for the one-time backfill;
     // user-invoked `gbrain extract links` stays outgoing-only.
     const activeResolver = includeFrontmatter ? resolver : nullResolver;
     const extracted = await extractPageLinks(
-      slug, fullContent, page.frontmatter, page.type, activeResolver,
+      slug, fullContent, (page.frontmatter || {}) as Record<string, unknown>, page.type as PageType, activeResolver,
     );
     unresolved.push(...extracted.unresolved);
 
@@ -646,8 +678,13 @@ async function extractLinksFromDB(
       const fromSlug = c.fromSlug ?? slug;
       if (!allSlugs.has(c.targetSlug)) continue;
       if (!allSlugs.has(fromSlug)) continue;
+      const pageSourceId = page.source_id ? String(page.source_id) : 'default';
+      const fromSourceId = c.fromSlug ? resolveSourceIdForSlug(fromSlug, pageSourceId) : pageSourceId;
+      const toSourceId = resolveSourceIdForSlug(c.targetSlug, pageSourceId);
+      const originSourceId = c.originSlug ? resolveSourceIdForSlug(c.originSlug, pageSourceId) : undefined;
+      if (!fromSourceId || !toSourceId || (c.originSlug && !originSourceId)) continue;
       if (dryRunSeen) {
-        const key = `${fromSlug}::${c.targetSlug}::${c.linkType}::${c.linkSource ?? 'markdown'}`;
+        const key = `${fromSlug}::${c.targetSlug}::${c.linkType}::${c.linkSource ?? 'markdown'}::${fromSourceId}::${toSourceId}`;
         if (dryRunSeen.has(key)) continue;
         dryRunSeen.add(key);
         if (jsonMode) {
@@ -668,6 +705,9 @@ async function extractLinksFromDB(
           link_source: c.linkSource,
           origin_slug: c.originSlug,
           origin_field: c.originField,
+          from_source_id: fromSourceId,
+          to_source_id: toSourceId,
+          origin_source_id: originSourceId,
         });
         if (batch.length >= BATCH_SIZE) await flush();
       }
@@ -705,9 +745,31 @@ async function extractTimelineFromDB(
   jsonMode: boolean,
   typeFilter: PageType | undefined,
   since: string | undefined,
+  scopeSourceId: string | undefined,
 ): Promise<{ created: number; pages: number }> {
-  const allSlugs = await engine.getAllSlugs();
-  const slugList = Array.from(allSlugs);
+  const scopedPages = scopeSourceId
+    ? await engine.executeRaw<Record<string, unknown>>(
+        `SELECT id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, source_id
+         FROM pages WHERE source_id = $1`,
+        [scopeSourceId],
+      )
+    : null;
+  const allSlugs = scopeSourceId ? new Set((scopedPages || []).map((row) => String(row.slug))) : await engine.getAllSlugs();
+  const slugList = scopeSourceId ? (scopedPages || []).map((row) => String(row.slug)) : Array.from(allSlugs);
+  const pageMetaRows = await engine.executeRaw<{ slug: string; type: string; source_id: string }>(
+    `SELECT slug, type, source_id FROM pages${scopeSourceId ? ' WHERE source_id = $1' : ''}`,
+    scopeSourceId ? [scopeSourceId] : [],
+  );
+  const pageMetasBySlug = new Map<string, Array<{ slug: string; type: string; source_id: string }>>();
+  const pageRecordByKey = new Map<string, Record<string, unknown>>();
+  for (const row of pageMetaRows) {
+    const slugValue = String(row.slug);
+    const sourceIdValue = String(row.source_id);
+    const list = pageMetasBySlug.get(slugValue) || [];
+    list.push({ slug: slugValue, type: String(row.type), source_id: sourceIdValue });
+    pageMetasBySlug.set(slugValue, list);
+    pageRecordByKey.set(`${sourceIdValue}::${slugValue}`, row as unknown as Record<string, unknown>);
+  }
   let processed = 0, created = 0;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
@@ -733,37 +795,64 @@ async function extractTimelineFromDB(
     }
   }
 
+  function getLinkedEntityProjectionSlugs(page: Record<string, unknown>): string[] {
+    if (String(page.type) !== 'note') return [];
+    const pageSourceId = page.source_id ? String(page.source_id) : 'default';
+    const refs = extractEntityRefs(String(page.compiled_truth || ''));
+    const unique = Array.from(new Set(
+      refs
+        .map((ref) => ref.slug)
+        .filter((candidateSlug) => {
+          const matches = pageMetasBySlug.get(candidateSlug) || [];
+          const inSameSource = matches.filter((row) => row.source_id === pageSourceId);
+          if (inSameSource.length !== 1) return false;
+          const targetType = inSameSource[0].type;
+          return targetType === 'person' || targetType === 'company';
+        }),
+    ));
+    return unique.length === 1 ? unique : [];
+  }
+
   for (let i = 0; i < slugList.length; i++) {
     const slug = slugList[i];
-    const page = await engine.getPage(slug);
+    const page = scopeSourceId
+      ? (scopedPages || []).find((row) => String(row.slug) === slug) as Record<string, unknown> | undefined
+      : await engine.getPage(slug) as unknown as Record<string, unknown> | undefined;
     if (!page) continue;
     if (typeFilter && page.type !== typeFilter) continue;
     if (since) {
-      const updatedMs = new Date(page.updated_at).getTime();
+      const updatedMs = new Date(String(page.updated_at)).getTime();
       const sinceMs = new Date(since).getTime();
       if (Number.isFinite(sinceMs) && updatedMs <= sinceMs) continue;
     }
 
-    const fullContent = page.compiled_truth + '\n' + page.timeline;
+    const fullContent = String(page.compiled_truth || '') + '\n' + String(page.timeline || '');
     const entries = parseTimelineEntries(fullContent);
+    const projectionSlugs = getLinkedEntityProjectionSlugs(page);
+    const pageSourceId = page.source_id ? String(page.source_id) : 'default';
 
     for (const entry of entries) {
-      if (dryRunSeen) {
-        const key = `${slug}::${entry.date}::${entry.summary}`;
-        if (dryRunSeen.has(key)) continue;
-        dryRunSeen.add(key);
-        if (jsonMode) {
-          process.stdout.write(JSON.stringify({
-            action: 'add_timeline', slug, date: entry.date,
-            summary: entry.summary, ...(entry.detail ? { detail: entry.detail } : {}),
-          }) + '\n');
+      const targetPages = [page, ...projectionSlugs.map((targetSlug) => pageRecordByKey.get(`${pageSourceId}::${targetSlug}`)).filter(Boolean) as Record<string, unknown>[]];
+      for (const targetPage of targetPages) {
+        const targetSlug = String(targetPage.slug);
+        const targetSourceId = targetPage.source_id ? String(targetPage.source_id) : pageSourceId;
+        if (dryRunSeen) {
+          const key = `${targetSlug}::${targetSourceId}::${entry.date}::${entry.summary}`;
+          if (dryRunSeen.has(key)) continue;
+          dryRunSeen.add(key);
+          if (jsonMode) {
+            process.stdout.write(JSON.stringify({
+              action: 'add_timeline', slug: targetSlug, date: entry.date,
+              summary: entry.summary, ...(entry.detail ? { detail: entry.detail } : {}),
+            }) + '\n');
+          } else {
+            console.log(`  ${targetSlug}: ${entry.date} — ${entry.summary}`);
+          }
+          created++;
         } else {
-          console.log(`  ${slug}: ${entry.date} — ${entry.summary}`);
+          batch.push({ slug: targetSlug, date: entry.date, summary: entry.summary, detail: entry.detail || '', source_id: targetSourceId });
+          if (batch.length >= BATCH_SIZE) await flush();
         }
-        created++;
-      } else {
-        batch.push({ slug, date: entry.date, summary: entry.summary, detail: entry.detail || '' });
-        if (batch.length >= BATCH_SIZE) await flush();
       }
     }
     processed++;
